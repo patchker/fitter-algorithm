@@ -4,8 +4,17 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import sqlite3
 import random
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:3000"],  # Lista źródeł, które mają być dozwolone
+    allow_credentials=True,
+    allow_methods=["*"],  # Dopuszczenie wszystkich metod, np. GET, POST, PUT, DELETE
+    allow_headers=["*"],  # Dopuszczenie wszystkich nagłówków
+)
 
 # Database connection
 def get_db_connection():
@@ -19,7 +28,16 @@ class Meal(BaseModel):
     name: str
     ingredients: List[str]
     calories: int
-    meal_type: str  # New field for meal type
+    protein: float = None
+    fat: float = None
+    carbs: float = None
+    meal_type: str
+    allergens: List[str] = []
+    base_grams: int = 0
+    portions: int = 1  # Nowe pole
+
+
+
 
 
 class DietPlan(BaseModel):
@@ -31,44 +49,62 @@ class DietRequest(BaseModel):
     start_date: date
     end_date: date
     meals_per_day: int
-    preferred_ingredients: List[str]
     max_calories: int
+    dietary_preferences: List[str] = []
+    allergens_to_avoid: List[str] = []
+    user_weight: int
+    not_preferred_ingredients: List[str]  # Zamiast preferred_ingredients
+
 
 # Combined API endpoint
 # Combined API endpoint
 @app.post("/generate-diet/")
 async def generate_diet(request: DietRequest):
     conn = get_db_connection()
-    meals = conn.execute('SELECT id, name, ingredients, calories, meal_type FROM meals').fetchall()
+    meals = conn.execute(
+        'SELECT id, name, ingredients, calories, protein, fat, carbs, meal_type, allergens, base_grams FROM meals').fetchall()
     conn.close()
+
+    ingredient_usage = {}  # Słownik do śledzenia częstotliwości użycia składników
 
     # Filter suitable meals
     suitable_meals = []
-    for meal in meals:
-        ingredients_list = meal['ingredients'].split(',')
+    for meal_row in meals:
+        meal = dict(meal_row)
+        ingredients_list = [ingredient.strip() for ingredient in meal['ingredients'].split(',')]
         meal_type = meal['meal_type'] if meal['meal_type'] is not None else 'default_type'
-        if any(ingredient in ingredients_list for ingredient in request.preferred_ingredients) and meal[
-            'calories'] <= request.max_calories:
+        allergens = meal.get('allergens', '')
+        allergens_set = set(allergens.split(',')) if allergens is not None else set()
+
+        if not allergens_set.intersection(request.allergens_to_avoid) and \
+                not any(non_pref in ingredients_list for non_pref in request.not_preferred_ingredients):
             suitable_meals.append(Meal(
                 id=meal['id'],
                 name=meal['name'],
                 ingredients=ingredients_list,
                 calories=meal['calories'],
-                meal_type=meal_type))
+                protein=meal['protein'],  # Dodane pole
+                fat=meal['fat'],  # Dodane pole
+                carbs=meal['carbs'],  # Dodane pole
+                meal_type=meal_type,
+                base_grams=meal['base_grams'],
+            )),
 
     if not suitable_meals:
         raise HTTPException(status_code=404, detail="No suitable meals found")
+
+    user_macros = calculate_macros(request.user_weight, request.max_calories-500)
 
     # Generate diet plan
     diet_plan = []
     current_date = request.start_date
     while current_date <= request.end_date:
-        daily_plan = generate_daily_plan(suitable_meals, request.meals_per_day, request.max_calories)
+        daily_plan = generate_daily_plan(suitable_meals, request.meals_per_day, request.max_calories-400, user_macros, ingredient_usage)
         diet_plan.append(DietPlan(date=current_date, meals=daily_plan['meals'], total_calories=daily_plan['total_calories']))
         current_date += timedelta(days=1)
 
     return diet_plan
-def generate_daily_plan(meals, meals_per_day, max_calories):
+def generate_daily_plan(meals, meals_per_day, max_calories, user_macros, ingredient_usage):
     # Define the meal types and calorie distribution based on the number of meals per day
     meal_types_calorie_distribution = {
         1: {'dinner': 1.0},
@@ -84,23 +120,56 @@ def generate_daily_plan(meals, meals_per_day, max_calories):
     selected_meals = []
     total_calories = 0
 
-    # Distribute meals across the selected types based on calorie distribution
+    selected_meal_types = meal_types_calorie_distribution.get(meals_per_day, {})
+    meals_by_type = group_meals_by_type(meals)
+
+
+    # Inicjalizacja zmiennych do śledzenia pozostałych makroskładników i kalorii
+    remaining_calories = max_calories
+    remaining_protein = user_macros['protein']
+    remaining_fat = user_macros['fat']
+    remaining_carbs = user_macros['carbs']
+
+    selected_meals = []
+    total_calories = 0
+    total_protein = 0
+    total_fat = 0
+    total_carbs = 0
+    selected_meals_ids = set()
+
     for meal_type, calorie_ratio in selected_meal_types.items():
         meals_in_type = meals_by_type.get(meal_type, [])
-        allocated_calories = max_calories * calorie_ratio
+        type_calories = max_calories * calorie_ratio  # Kalorie przeznaczone na ten typ posiłku
 
-        for _ in range(len(meals_in_type)):
-            if not meals_in_type or total_calories >= max_calories:
-                break
-
-            meal = select_meal_close_to_calorie_target(meals_in_type, allocated_calories)
+        while meals_in_type and type_calories > 0:
+            meal, portions = select_meal_close_to_macros_target(meals_in_type, type_calories, remaining_protein, remaining_fat, remaining_carbs,max_calories, selected_meals_ids,ingredient_usage)
             if meal:
-                selected_meals.append(meal)
-                total_calories += meal.calories
+                # Aktualizacja pozostałych makroskładników i kalorii
+                type_calories -= meal.calories * portions
+                remaining_calories -= meal.calories * portions
+                remaining_protein -= meal.protein * portions
+                remaining_fat -= meal.fat * portions
+                remaining_carbs -= meal.carbs * portions
+
+                # Przygotowanie i dodanie posiłku do wybranej listy
+                new_meal = meal.copy()  # Tworzy kopię posiłku
+                new_meal.calories *= portions
+                new_meal.protein *= portions
+                new_meal.fat *= portions
+                new_meal.carbs *= portions
+                new_meal.portions = portions  # Ustawienie liczby porcji
+
+                selected_meals.append(new_meal)
+                total_calories += new_meal.calories
+                total_protein += new_meal.protein
+                total_fat += new_meal.fat
+                total_carbs += new_meal.carbs
+                selected_meals_ids.add(meal.id)
                 meals_in_type.remove(meal)
+                for ingredient in new_meal.ingredients:
+                    ingredient_usage[ingredient] = ingredient_usage.get(ingredient, 0) + 1
 
-    return {'meals': selected_meals, 'total_calories': total_calories}
-
+    return {'meals': selected_meals, 'total_calories': total_calories, 'total_protein': total_protein, 'total_fat': total_fat, 'total_carbs': total_carbs}
 
 def group_meals_by_type(meals):
     meals_by_type = {}
@@ -110,16 +179,58 @@ def group_meals_by_type(meals):
         meals_by_type[meal.meal_type].append(meal)
     return meals_by_type
 
-def select_meal_close_to_calorie_target(meals, calorie_target):
-    if not meals:
-        return None
 
-    # Sort the meals by how close their calories are to the target
-    sorted_meals = sorted(meals, key=lambda meal: abs(meal.calories - calorie_target))
+def select_meal_close_to_macros_target(meals, remaining_calories, remaining_protein, remaining_fat, remaining_carbs, max_daily_calories, selected_meals_ids, ingredient_usage):
+    best_fit = None
+    best_fit_portions = 0
+    best_fit_diff = float('inf')
 
-    # Choose from the top N closest meals to add randomness
-    top_n = 3  # You can adjust this number as needed
-    top_choices = sorted_meals[:min(len(sorted_meals), top_n)]
+    for meal in meals:
+        if meal.id in selected_meals_ids:
+            continue
+        for portions in range(1, 6):  # Ograniczenie do 5 porcji
+            if meal.calories * portions > max_daily_calories:
+                break  # Przerwanie pętli, jeśli przekracza limit kalorii
 
-    # Randomly select one of the top choices
-    return random.choice(top_choices) if top_choices else None
+            calorie_diff = abs(remaining_calories - meal.calories * portions)
+            protein_diff = abs(remaining_protein - meal.protein * portions)
+            fat_diff = abs(remaining_fat - meal.fat * portions)
+            carbs_diff = abs(remaining_carbs - meal.carbs * portions)
+
+            # Agregacja różnic do pojedynczej wartości
+            total_diff = calorie_diff + protein_diff + fat_diff + carbs_diff
+
+            # Modyfikacja oceny posiłku w zależności od częstotliwości składników
+            ingredient_frequency = sum(ingredient_usage.get(ing, 0) for ing in meal.ingredients)
+            total_diff += ingredient_frequency ** 2
+
+            if total_diff < best_fit_diff:
+                best_fit = meal
+                best_fit_portions = portions
+                best_fit_diff = total_diff
+
+    return best_fit, best_fit_portions
+
+
+
+
+
+def calculate_macros(weight, total_calories):
+    # Przykładowe procentowe rozkłady makroskładników
+    protein_percentage = 0.20  # 20% kalorii z białka
+    fat_percentage = 0.30     # 30% kalorii z tłuszczu
+    carbs_percentage = 0.50   # 50% kalorii z węglowodanów
+
+    protein_calories = total_calories * protein_percentage
+    fat_calories = total_calories * fat_percentage
+    carbs_calories = total_calories * carbs_percentage
+
+    protein_grams = protein_calories / 4  # 1 gram białka = 4 kcal
+    fat_grams = fat_calories / 9          # 1 gram tłuszczu = 9 kcal
+    carbs_grams = carbs_calories / 4      # 1 gram węglowodanów = 4 kcal
+
+    return {
+        "protein": protein_grams,
+        "fat": fat_grams,
+        "carbs": carbs_grams
+    }
