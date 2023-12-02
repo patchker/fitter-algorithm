@@ -1,4 +1,7 @@
 import asyncio
+import calendar
+from datetime import datetime, timedelta
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 import requests
 
@@ -10,16 +13,17 @@ from pydantic import BaseModel
 import sqlite3
 import random
 from fastapi.middleware.cors import CORSMiddleware
-
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
 
 app = FastAPI()
 task_queue = asyncio.Queue()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:3000"],  # Lista źródeł, które mają być dozwolone
+    allow_origins=["http://127.0.0.1:3000", "http://127.0.0.1:8000"],
     allow_credentials=True,
-    allow_methods=["*"],  # Dopuszczenie wszystkich metod, np. GET, POST, PUT, DELETE
-    allow_headers=["*"],  # Dopuszczenie wszystkich nagłówków
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 def get_db_connection():
@@ -43,15 +47,15 @@ class Meal(BaseModel):
 
 
 class DietRequest(BaseModel):
-    start_date: date
-    end_date: date
+    user: int
+    duration: int
     meals_per_day: int
     max_calories: int
     dietary_preferences: List[str] = []
     allergens_to_avoid: List[str] = []
     user_weight: int
     not_preferred_ingredients: List[str] = []
-    callback_url: HttpUrl  # Dodane pole dla URL callback
+    callback_url: HttpUrl
 
 class DietPlan(BaseModel):
     date: date
@@ -67,19 +71,21 @@ class DietPlan(BaseModel):
 
 
 
+
 async def process_task_queue():
     while True:
         diet_request, callback_url = await task_queue.get()
         try:
-            # Przetwarzanie żądania diety (tutaj umieść swoją logikę)
+            # Przetwarzanie żądania diety
             diet_plan = await generate_diet_logic(diet_request)
             # Informowanie serwera Django o zakończeniu zadania
-            requests.post(callback_url, json={'status': 'completed', 'diet_plan': diet_plan})
+            requests.post(callback_url, json={'status': 'completed', 'user_id': diet_request.user, 'diet_plan': diet_plan})
         except Exception as e:
             # W przypadku błędu, informuj serwer Django
-            requests.post(callback_url, json={'status': 'error', 'error': str(e)})
+            requests.post(callback_url, json={'status': 'error', 'user_id': diet_request.user, 'error': str(e)})
         finally:
             task_queue.task_done()
+
 
 asyncio.create_task(process_task_queue())
 
@@ -87,6 +93,7 @@ asyncio.create_task(process_task_queue())
 async def generate_diet(request: DietRequest, background_tasks: BackgroundTasks):
     callback_url = request.callback_url
     background_tasks.add_task(task_queue.put, (request, callback_url))
+    print("DietRequest.user", request.user)
     return {"message": "Zadanie zostało dodane do kolejki"}
 
 async def generate_diet_logic(diet_request):
@@ -125,14 +132,25 @@ async def generate_diet_logic(diet_request):
 
     user_macros = calculate_macros(diet_request.user_weight, diet_request.max_calories - 500)
 
-    # Generate diet plan
+    # Ustawienie aktualnej daty jako start_date
+    current_date = datetime.now().date()  # Aktualna data
+
+    # Obliczenie end_date na podstawie duration
+    months_to_add = diet_request.duration
+    end_date = current_date + relativedelta(months=months_to_add)
+
+    # Generowanie planu diety
     diet_plan = []
-    current_date = diet_request.start_date
-    while current_date <= diet_request.end_date:
-        daily_plan = generate_daily_plan(suitable_meals, diet_request.meals_per_day, diet_request.max_calories - 400, user_macros,
-                                         ingredient_usage)
+    while current_date <= end_date:
+        daily_plan = generate_daily_plan(suitable_meals, diet_request.meals_per_day, diet_request.max_calories - 400,
+                                         user_macros, ingredient_usage)
         diet_plan.append(
-            DietPlan(date=current_date, meals=daily_plan['meals'], total_calories=daily_plan['total_calories']))
+            DietPlan(
+                date=current_date,
+                meals=daily_plan['meals'],
+                total_calories=daily_plan['total_calories']
+            )
+        )
         current_date += timedelta(days=1)
 
     return [diet_plan.to_dict() for diet_plan in diet_plan]
