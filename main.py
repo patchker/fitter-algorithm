@@ -93,7 +93,6 @@ asyncio.create_task(process_task_queue())
 async def generate_diet(request: DietRequest, background_tasks: BackgroundTasks):
     callback_url = request.callback_url
     background_tasks.add_task(task_queue.put, (request, callback_url))
-    print("DietRequest.user", request.user)
     return {"message": "Zadanie zostało dodane do kolejki"}
 
 async def generate_diet_logic(diet_request):
@@ -101,7 +100,8 @@ async def generate_diet_logic(diet_request):
     meals = conn.execute(
         'SELECT id, name, ingredients, calories, protein, fat, carbs, meal_type, allergens, base_grams FROM meals').fetchall()
     conn.close()
-
+    print("diet_request.allergens_to_avoid",diet_request.allergens_to_avoid)
+    print("diet_request.not_preferred_ingredients",diet_request.not_preferred_ingredients)
     ingredient_usage = {}  # Słownik do śledzenia częstotliwości użycia składników
 
     # Filter suitable meals
